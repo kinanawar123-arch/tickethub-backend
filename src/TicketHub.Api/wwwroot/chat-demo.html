@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TicketHub — SignalR chat demo</title>
+
+<!--
+  ============================================================================
+  A DELIBERATELY MINIMAL SIGNALR CLIENT
+  ============================================================================
+
+  One file, no build step, no framework. Open two browser windows, sign in as
+  two different users, and watch messages arrive without anybody refreshing.
+
+  Read the JavaScript at the bottom alongside ChatHub.cs — the two sides mirror
+  each other, and seeing them together is the fastest way to understand what
+  SignalR actually does.
+
+  Demo accounts (all use the password Passw0rd!):
+    admin@tickethub.local       Admin
+    supervisor@tickethub.local  Supervisor, Roads
+    sara@tickethub.local        Agent, Roads
+    citizen@tickethub.local     Citizen — reported most of the demo tickets
+  ============================================================================
+-->
+
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 24px; max-width: 860px; margin-inline: auto;
+    background: Canvas; color: CanvasText; line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { opacity: .7; font-size: .9rem; margin-bottom: 20px; }
+  fieldset { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+             border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  legend { font-weight: 600; padding-inline: 6px; }
+  label { display: block; font-size: .8rem; opacity: .75; margin-bottom: 4px; }
+  input, button, select {
+    font: inherit; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+    background: Canvas; color: CanvasText;
+  }
+  button { cursor: pointer; background: color-mix(in srgb, CanvasText 8%, Canvas); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > div { flex: 1 1 200px; }
+  .row input { width: 100%; }
+  #status { font-size: .85rem; padding: 6px 10px; border-radius: 999px; display: inline-block; }
+  .off { background: #fde2e1; color: #8b1a13; }
+  .on  { background: #d9f2e2; color: #0f5132; }
+  #messages { height: 320px; overflow-y: auto; padding: 12px;
+              border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 10px; }
+  .msg { margin-bottom: 10px; }
+  .msg .who { font-weight: 600; font-size: .85rem; }
+  .msg .when { opacity: .55; font-size: .75rem; margin-left: 6px; }
+  .msg.mine .who { color: #0a7; }
+  .sys { font-style: italic; opacity: .6; font-size: .85rem; }
+  #typing { height: 20px; font-size: .8rem; opacity: .7; }
+  code { background: color-mix(in srgb, CanvasText 8%, Canvas); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<h1>TicketHub live chat</h1>
+<div class="sub">
+  A bare-bones SignalR client. Open this page in two windows, sign in as two different
+  people, join the same conversation, and type.
+</div>
+
+<fieldset>
+  <legend>1 · Sign in</legend>
+  <div class="row">
+    <div>
+      <label for="email">Email</label>
+      <input id="email" value="sara@tickethub.local">
+    </div>
+    <div>
+      <label for="password">Password</label>
+      <input id="password" type="password" value="Passw0rd!">
+    </div>
+    <div style="flex:0 0 auto">
+      <button id="loginBtn">Sign in</button>
+    </div>
+  </div>
+  <p id="who" class="sub" style="margin:10px 0 0"></p>
+</fieldset>
+
+<fieldset>
+  <legend>2 · Connect and join</legend>
+  <div class="row">
+    <div style="flex:0 0 auto"><span id="status" class="off">disconnected</span></div>
+    <div>
+      <label for="ticketId">Open the chat for ticket #</label>
+      <input id="ticketId" type="number" value="1">
+    </div>
+    <div style="flex:0 0 auto">
+      <button id="openBtn" disabled>Open conversation</button>
+    </div>
+  </div>
+  <p class="sub" style="margin:10px 0 0">
+    Uses <code>POST /api/chat/tickets/{id}/conversation</code>, which creates the thread the
+    first time and returns the existing one afterwards.
+  </p>
+</fieldset>
+
+<fieldset>
+  <legend>3 · Chat</legend>
+  <div id="messages"></div>
+  <div id="typing"></div>
+  <div class="row" style="margin-top:10px">
+    <div><input id="body" placeholder="Type a message and press Enter" disabled></div>
+    <div style="flex:0 0 auto"><button id="sendBtn" disabled>Send</button></div>
+  </div>
+</fieldset>
+
+<!--
+  Loaded from a local copy so the page works with no internet connection and no
+  npm install. In a real front end this is `npm i @microsoft/signalr`.
+-->
+<script src="signalr.min.js"></script>
+
+<script>
+const API = window.location.origin;
+
+let token = null;        // the JWT from /api/auth/login
+let me = null;           // the signed-in user, from the login response
+let connection = null;   // the SignalR HubConnection
+let conversationId = null;
+
+const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// 1 · Sign in — a plain fetch. Nothing SignalR-specific yet.
+// ---------------------------------------------------------------------------
+$('loginBtn').onclick = async () => {
+  const response = await fetch(`${API}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: $('email').value, password: $('password').value })
+  });
+
+  if (!response.ok) {
+    const problem = await response.json().catch(() => ({}));
+    alert(problem.title || 'Sign-in failed');
+    return;
+  }
+
+  const auth = await response.json();
+  token = auth.accessToken;
+  me = auth.user;
+
+  $('who').textContent = `Signed in as ${me.displayName} — roles: ${me.roles.join(', ')}`;
+  $('openBtn').disabled = false;
+
+  await connect();
+};
+
+// ---------------------------------------------------------------------------
+// 2 · Connect the hub
+// ---------------------------------------------------------------------------
+async function connect() {
+  connection = new signalR.HubConnectionBuilder()
+    .withUrl(`${API}/hubs/chat`, {
+      // THE TOKEN. A browser WebSocket cannot set an Authorization header, so the
+      // client library appends this as ?access_token=… instead. The server picks it
+      // up in the OnMessageReceived handler in Program.cs — and only for /hubs paths,
+      // because tokens in URLs end up in logs and browser history.
+      accessTokenFactory: () => token
+    })
+    // Reconnect automatically after a dropped connection: wifi blip, laptop lid,
+    // server restart. Without this the chat silently stops working and the user has
+    // no idea why.
+    .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
+    .configureLogging(signalR.LogLevel.Information)
+    .build();
+
+  // --- Server → client. These names must match SignalRNotifier.cs exactly. -----
+  // They are magic strings on both sides, so a typo means silence, not an error.
+
+  connection.on('ReceiveMessage', message => {
+    if (message.conversationId !== conversationId) return;
+    render(message);
+  });
+
+  connection.on('ReceiveNotification', notification => {
+    renderSystem(`🔔 ${notification.title}`);
+  });
+
+  connection.on('UserTyping', indicator => {
+    if (indicator.userId === me.id) return;   // never show your own typing
+    $('typing').textContent = indicator.isTyping ? `${indicator.displayName} is typing…` : '';
+  });
+
+  connection.on('JoinedConversation', async id => {
+    // The server cannot add someone else's CONNECTION to a group — only a hub method
+    // can, because only it knows the connection id. So the server asks, and we call
+    // back in. See the comment in SignalRNotifier.AddUserToConversationAsync.
+    await connection.invoke('JoinConversation', id);
+  });
+
+  connection.onreconnecting(() => setStatus(false, 'reconnecting…'));
+  connection.onreconnected(async () => {
+    setStatus(true, 'connected');
+    // Groups are per-connection and a reconnect is a NEW connection, so rejoin.
+    // Forgetting this is the classic "it works until the wifi hiccups" bug.
+    if (conversationId) await connection.invoke('JoinConversation', conversationId);
+  });
+  connection.onclose(() => setStatus(false, 'disconnected'));
+
+  await connection.start();
+  setStatus(true, 'connected');
+}
+
+// ---------------------------------------------------------------------------
+// 3 · Open a ticket's conversation and load its history
+// ---------------------------------------------------------------------------
+$('openBtn').onclick = async () => {
+  const ticketId = $('ticketId').value;
+
+  const response = await fetch(`${API}/api/chat/tickets/${ticketId}/conversation`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  if (!response.ok) {
+    const problem = await response.json().catch(() => ({}));
+    alert(problem.title || 'Could not open the conversation');
+    return;
+  }
+
+  const conversation = await response.json();
+  conversationId = conversation.id;
+
+  await connection.invoke('JoinConversation', conversationId);
+
+  // HISTORY OVER REST, LIVE MESSAGES OVER THE SOCKET.
+  // This is the division of labour: the socket only carries what arrives while you
+  // are looking. Everything before that is a normal paged GET.
+  const history = await fetch(
+    `${API}/api/chat/conversations/${conversationId}/messages?pageSize=50`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  ).then(r => r.json());
+
+  $('messages').innerHTML = '';
+  renderSystem(`— ${conversation.title} · ${conversation.participants.length} participants —`);
+
+  // The API returns newest-first (cursor paging); reverse for display.
+  history.items.slice().reverse().forEach(render);
+
+  $('body').disabled = false;
+  $('sendBtn').disabled = false;
+  $('body').focus();
+};
+
+// ---------------------------------------------------------------------------
+// 4 · Send
+// ---------------------------------------------------------------------------
+async function send() {
+  const body = $('body').value.trim();
+  if (!body || !conversationId) return;
+
+  $('body').value = '';
+  await connection.invoke('SetTyping', conversationId, false);
+
+  // clientMessageId lets the server recognise a retry after a dropped connection,
+  // and lets us match the server's broadcast to a bubble we already drew.
+  // See ChatMessage.ClientMessageId for the full story.
+  await connection.invoke('SendMessage', conversationId, {
+    body,
+    clientMessageId: crypto.randomUUID()
+  });
+}
+
+$('sendBtn').onclick = send;
+
+let typingTimer = null;
+$('body').addEventListener('keydown', async e => {
+  if (e.key === 'Enter') { await send(); return; }
+
+  if (!conversationId) return;
+
+  await connection.invoke('SetTyping', conversationId, true);
+
+  // Debounce the "stopped typing" signal. Without it you would send an event per
+  // keystroke, which is a lot of traffic to say very little.
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(
+    () => connection.invoke('SetTyping', conversationId, false), 1500);
+});
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+function render(message) {
+  const div = document.createElement('div');
+  div.className = 'msg' + (message.senderId === me?.id ? ' mine' : '');
+
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = message.senderName;
+
+  const when = document.createElement('span');
+  when.className = 'when';
+  when.textContent = new Date(message.sentAt + 'Z').toLocaleTimeString();
+
+  const body = document.createElement('div');
+  // textContent, never innerHTML. A chat message is untrusted input, and innerHTML
+  // here would be a stored XSS hole that every participant gets to trigger.
+  body.textContent = message.body;
+
+  div.append(who, when, body);
+  $('messages').append(div);
+  $('messages').scrollTop = $('messages').scrollHeight;
+}
+
+function renderSystem(text) {
+  const div = document.createElement('div');
+  div.className = 'sys';
+  div.textContent = text;
+  $('messages').append(div);
+}
+
+function setStatus(ok, text) {
+  $('status').className = ok ? 'on' : 'off';
+  $('status').textContent = text;
+}
+</script>
+</body>
+</html>

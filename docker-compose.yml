@@ -1,0 +1,109 @@
+# =============================================================================
+# TicketHub — the database, in a container
+# =============================================================================
+#
+#   docker compose up -d      start it
+#   docker compose logs -f    watch it start (first boot takes ~30 seconds)
+#   docker compose down       stop it, keep the data
+#   docker compose down -v    stop it and DELETE the data (a clean slate)
+#
+# Why a container rather than installing SQL Server?
+#   • It runs the same way on macOS, Windows and Linux — including Apple Silicon,
+#     where there is no native SQL Server at all.
+#   • "docker compose down -v" gives everyone an identical clean database in
+#     seconds, which makes "works on my machine" a much shorter conversation.
+#   • Nothing is installed on the host, so removing it is one command.
+# =============================================================================
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: tickethub-sql
+
+    # On Apple Silicon this image is amd64 and runs under Rosetta emulation.
+    # It works and it is a little slower than native. If it will not start on your
+    # machine, switch the API to PostgreSQL: set Database:Provider to "Postgres"
+    # and use the postgres service at the bottom of this file instead.
+    platform: linux/amd64
+
+    environment:
+      ACCEPT_EULA: "Y"
+
+      # The sa password. It matches the connection string in
+      # appsettings.Development.json, and it is in source control on purpose —
+      # this database holds nothing but demo data on your own machine.
+      #
+      # ⚠ In anything real: no sa account for the application at all. You create a
+      # least-privileged login that can read and write data and cannot alter the
+      # schema, and its password comes from a secret store.
+      MSSQL_SA_PASSWORD: "TicketHub!Dev2026"
+
+      # Developer edition: free, and functionally identical to Enterprise.
+      MSSQL_PID: "Developer"
+
+    ports:
+      # host:container. If 1433 is already taken on your machine, change the LEFT
+      # number and the connection string to match — never the right one.
+      - "1433:1433"
+
+    volumes:
+      # A named volume, so your data survives "docker compose down" and a restart.
+      # Only "down -v" removes it.
+      - tickethub-sqldata:/var/opt/mssql
+
+    healthcheck:
+      # Compose does not otherwise know the difference between "the container is
+      # running" and "SQL Server is ready to accept connections" — and there are
+      # about 30 seconds between those two on a first boot.
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — the fallback
+  # ---------------------------------------------------------------------------
+  # Only needed if SQL Server will not run on your machine. To use it:
+  #
+  #   1. docker compose up -d postgres
+  #   2. In appsettings.Development.json set:
+  #        "Database": { "Provider": "Postgres" }
+  #        "ConnectionStrings:Default":
+  #          "Host=localhost;Port=5432;Database=TicketHub;Username=tickethub;Password=TicketHub!Dev2026"
+  #   3. Delete src/TicketHub.DataAccess/Migrations and regenerate:
+  #        dotnet ef migrations add InitialCreate \
+  #          --project src/TicketHub.DataAccess --startup-project src/TicketHub.Api
+  #
+  # Step 3 is necessary because a migration contains provider-specific SQL —
+  # column types, and the bracket-quoted [Column] names in our check constraints
+  # and filtered indexes. Migrations are not portable between providers.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: tickethub-postgres
+    profiles: ["postgres"] # only starts with: docker compose --profile postgres up -d
+    environment:
+      POSTGRES_DB: TicketHub
+      POSTGRES_USER: tickethub
+      POSTGRES_PASSWORD: "TicketHub!Dev2026"
+    ports:
+      - "5432:5432"
+    volumes:
+      - tickethub-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tickethub -d TicketHub"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  tickethub-sqldata:
+  tickethub-pgdata:

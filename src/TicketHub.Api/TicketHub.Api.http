@@ -1,0 +1,487 @@
+### =========================================================================
+### TicketHub — a walk through the whole API
+### =========================================================================
+###
+### Open this file in Visual Studio or VS Code (with the REST Client extension)
+### and click "Send Request" above each block. Run them in order: the login
+### block sets the @token variable that everything below it uses.
+###
+### It is worth doing once end to end before reading the code — the shape of
+### the API makes the layering much easier to follow.
+### =========================================================================
+
+@host = http://localhost:5048
+
+### -------------------------------------------------------------------------
+### 0 · Is it alive?
+### -------------------------------------------------------------------------
+GET {{host}}/health
+
+### -------------------------------------------------------------------------
+### 1 · Sign in as the administrator
+### -------------------------------------------------------------------------
+### The @login name captures the response so later requests can read
+### {{login.response.body.accessToken}} without any copy-and-paste.
+# @name login
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "admin@tickethub.local",
+  "password": "Passw0rd!"
+}
+
+###
+@token = {{login.response.body.accessToken}}
+@refresh = {{login.response.body.refreshToken}}
+
+### -------------------------------------------------------------------------
+### 2 · Who am I?
+### -------------------------------------------------------------------------
+### No id parameter. The answer comes from the token, so it can only ever be
+### about the caller — nothing to tamper with.
+GET {{host}}/api/auth/me
+Authorization: Bearer {{token}}
+
+### -------------------------------------------------------------------------
+### 3 · Reference data
+### -------------------------------------------------------------------------
+GET {{host}}/api/departments
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/api/categories?pageSize=50
+Authorization: Bearer {{token}}
+
+### The slim version, for a dropdown. Two fields instead of twelve.
+GET {{host}}/api/categories/lookup
+Authorization: Bearer {{token}}
+
+### -------------------------------------------------------------------------
+### 4 · Tickets — the filters
+### -------------------------------------------------------------------------
+### Every one of these is optional and they compose. All of it becomes ONE
+### SELECT — see TicketRepository.SearchAsync.
+GET {{host}}/api/tickets?page=1&pageSize=10&sortBy=createdAt&sortDescending=true
+Authorization: Bearer {{token}}
+
+### Open and urgent
+GET {{host}}/api/tickets?status=Open&priority=Urgent
+Authorization: Bearer {{token}}
+
+### Past its SLA and not finished
+GET {{host}}/api/tickets?overdue=true
+Authorization: Bearer {{token}}
+
+### Nobody has picked it up
+GET {{host}}/api/tickets?unassigned=true
+Authorization: Bearer {{token}}
+
+### Free-text over title, ticket number and reporter name
+GET {{host}}/api/tickets?search=pothole
+Authorization: Bearer {{token}}
+
+### One department, newest first
+GET {{host}}/api/tickets?departmentId=1&sortBy=createdAt
+Authorization: Bearer {{token}}
+
+### -------------------------------------------------------------------------
+### 5 · One ticket, in full
+### -------------------------------------------------------------------------
+### Comments, attachments, history and rating — one query, all projected.
+GET {{host}}/api/tickets/1
+Authorization: Bearer {{token}}
+
+### -------------------------------------------------------------------------
+### 6 · Create a ticket
+### -------------------------------------------------------------------------
+### Note what is NOT in the body: no status (always Open), no ticket number
+### (generated), and no createdByUserId (taken from the token — see the
+### mass-assignment warning on CreateTicketDto).
+# @name created
+POST {{host}}/api/tickets
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "title": "Fallen tree blocking the cycle path",
+  "description": "A large branch came down overnight and is blocking the whole cycle path near the school.",
+  "categoryId": 8,
+  "priority": "High",
+  "reporterName": "Nadia Haddad",
+  "reporterPhone": "+970-59-555-1234",
+  "reporterEmail": "nadia@example.com",
+  "locationAddress": "Cycle path beside Al-Amal School",
+  "latitude": 31.9522,
+  "longitude": 35.2332
+}
+
+###
+@newTicketId = {{created.response.body.id}}
+
+### -------------------------------------------------------------------------
+### 7 · Validation — these are SUPPOSED to fail
+### -------------------------------------------------------------------------
+### Title too short + description too short → 400 with a field-by-field body.
+POST {{host}}/api/tickets
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "title": "Hi",
+  "description": "short",
+  "categoryId": 1,
+  "reporterName": "X"
+}
+
+### Half a coordinate. Attributes cannot catch this — it needs two properties at
+### once, which is what Ticket.Validate (IValidatableObject) is for.
+POST {{host}}/api/tickets
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "title": "Coordinates that point nowhere",
+  "description": "This request supplies a latitude but no longitude, so it should be rejected.",
+  "categoryId": 1,
+  "reporterName": "Test Reporter",
+  "latitude": 31.9522
+}
+
+### Category that does not exist → 400. [Required] proved a number arrived;
+### only the database can prove the number means something.
+POST {{host}}/api/tickets
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "title": "Category ninety-nine does not exist",
+  "description": "The service checks this against the database before doing anything else.",
+  "categoryId": 9999,
+  "reporterName": "Test Reporter"
+}
+
+### -------------------------------------------------------------------------
+### 8 · The workflow
+### -------------------------------------------------------------------------
+### Open → InProgress. Legal.
+PATCH {{host}}/api/tickets/2/status
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "newStatus": "InProgress"
+}
+
+### InProgress → Resolved. Also legal, and it stamps ResolvedAt.
+PATCH {{host}}/api/tickets/2/status
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "newStatus": "Resolved",
+  "reason": "Crew attended and repaired the surface."
+}
+
+### Resolved → Open. NOT legal → 409, with a message listing what is allowed.
+### The rule lives in TicketWorkflow.cs as a table, not as scattered ifs.
+PATCH {{host}}/api/tickets/2/status
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "newStatus": "Open"
+}
+
+### Cancelling without a reason → 400. An audit trail with no reason is half an
+### audit trail.
+PATCH {{host}}/api/tickets/4/status
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "newStatus": "Cancelled"
+}
+
+### -------------------------------------------------------------------------
+### 9 · Assignment
+### -------------------------------------------------------------------------
+GET {{host}}/api/agents?hasCapacity=true
+Authorization: Bearer {{token}}
+
+### Assign explicitly. Refused if the agent is in a different department or is
+### already at their ticket limit.
+PATCH {{host}}/api/tickets/2/assign
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "agentId": 2,
+  "note": "Sara knows this street."
+}
+
+### Or let the server pick the least-loaded agent in the ticket's department.
+POST {{host}}/api/tickets/9/auto-assign
+Authorization: Bearer {{token}}
+
+### Un-assign: send null, and the ticket goes back in the queue.
+PATCH {{host}}/api/tickets/2/assign
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "agentId": null,
+  "note": "Back to the queue — Sara is on leave."
+}
+
+### -------------------------------------------------------------------------
+### 10 · Comments
+### -------------------------------------------------------------------------
+GET {{host}}/api/tickets/1/comments
+Authorization: Bearer {{token}}
+
+### A public comment — the reporter is notified.
+POST {{host}}/api/tickets/1/comments
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "body": "A crew is booked for Thursday morning. We will update you once it is done.",
+  "isInternal": false
+}
+
+### An internal note. Staff only — a Citizen never receives this row, because
+### the repository filters it out in SQL rather than trusting the front end.
+POST {{host}}/api/tickets/1/comments
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "body": "Third complaint about this street this month. Worth flagging for resurfacing.",
+  "isInternal": true
+}
+
+### -------------------------------------------------------------------------
+### 11 · Live chat over plain HTTP
+### -------------------------------------------------------------------------
+### The same service the SignalR hub calls — two doors, one set of rules.
+### For the real-time half, open http://localhost:5048/chat-demo.html
+# @name conversation
+POST {{host}}/api/chat/tickets/1/conversation
+Authorization: Bearer {{token}}
+
+###
+@conversationId = {{conversation.response.body.id}}
+
+### Saved, then broadcast to everyone connected — in that order.
+POST {{host}}/api/chat/conversations/{{conversationId}}/messages
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "body": "Hello — I am looking at your ticket now.",
+  "clientMessageId": "11111111-2222-3333-4444-555555555555"
+}
+
+### Send the SAME clientMessageId again. Idempotent: you get the original
+### message back rather than a duplicate.
+POST {{host}}/api/chat/conversations/{{conversationId}}/messages
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "body": "Hello — I am looking at your ticket now.",
+  "clientMessageId": "11111111-2222-3333-4444-555555555555"
+}
+
+### History. Cursor paging, not Skip/Take — see ChatRepository.GetMessagesAsync.
+GET {{host}}/api/chat/conversations/{{conversationId}}/messages?pageSize=20
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/api/chat/conversations
+Authorization: Bearer {{token}}
+
+### -------------------------------------------------------------------------
+### 12 · Notifications
+### -------------------------------------------------------------------------
+GET {{host}}/api/notifications
+Authorization: Bearer {{token}}
+
+### The badge. A COUNT, not a list you call .length on.
+GET {{host}}/api/notifications/unread-count
+Authorization: Bearer {{token}}
+
+###
+POST {{host}}/api/notifications/read-all
+Authorization: Bearer {{token}}
+
+### -------------------------------------------------------------------------
+### 13 · Reports
+### -------------------------------------------------------------------------
+### Grouped, averaged, sorted and paged in one query. No Rating row is loaded.
+GET {{host}}/api/reports/category-satisfaction
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/api/reports/daily-volume
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/api/tickets/statistics
+Authorization: Bearer {{token}}
+
+### -------------------------------------------------------------------------
+### 14 · The department boundary — the interesting one
+### -------------------------------------------------------------------------
+### Sign in as Sara, a Roads agent.
+# @name saraLogin
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "sara@tickethub.local",
+  "password": "Passw0rd!"
+}
+
+###
+@saraToken = {{saraLogin.response.body.accessToken}}
+
+### Roads tickets only. Not because she asked for Roads — because that is all
+### the access filter will let the query return.
+GET {{host}}/api/tickets
+Authorization: Bearer {{saraToken}}
+
+### Ask explicitly for Sanitation (department 2) anyway. Still empty: the filter
+### is applied BEFORE any caller-supplied filter, so it cannot be widened.
+GET {{host}}/api/tickets?departmentId=2
+Authorization: Bearer {{saraToken}}
+
+### Ticket 4 is a Sanitation ticket. It exists, and for Sara it is a 404 —
+### deliberately, because a 403 would confirm it exists.
+GET {{host}}/api/tickets/4
+Authorization: Bearer {{saraToken}}
+
+### Deleting is Admin only → 403. She is authenticated; the answer is still no.
+DELETE {{host}}/api/tickets/1
+Authorization: Bearer {{saraToken}}
+
+### -------------------------------------------------------------------------
+### 15 · A citizen sees only their own
+### -------------------------------------------------------------------------
+# @name citizenLogin
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "citizen@tickethub.local",
+  "password": "Passw0rd!"
+}
+
+###
+@citizenToken = {{citizenLogin.response.body.accessToken}}
+
+### Only the tickets Ahmad reported.
+GET {{host}}/api/tickets
+Authorization: Bearer {{citizenToken}}
+
+### Note the comment list: the internal note added in section 10 is NOT here.
+GET {{host}}/api/tickets/1/comments
+Authorization: Bearer {{citizenToken}}
+
+### Rating a resolved ticket he reported → works.
+POST {{host}}/api/tickets/5/rating
+Authorization: Bearer {{citizenToken}}
+Content-Type: application/json
+
+{
+  "stars": 5,
+  "comment": "Sorted the next morning. Thank you."
+}
+
+### The same ticket again → 409. One rating per ticket, enforced by a unique index.
+POST {{host}}/api/tickets/5/rating
+Authorization: Bearer {{citizenToken}}
+Content-Type: application/json
+
+{
+  "stars": 1,
+  "comment": "Trying to rate it twice."
+}
+
+### -------------------------------------------------------------------------
+### 16 · Registration and the token life cycle
+### -------------------------------------------------------------------------
+POST {{host}}/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "newcitizen@example.com",
+  "password": "Passw0rd!",
+  "confirmPassword": "Passw0rd!",
+  "displayName": "New Citizen",
+  "phoneNumber": "+970-59-000-1111"
+}
+
+### Weak password → 400, with Identity's own messages passed straight through.
+POST {{host}}/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "weak@example.com",
+  "password": "password",
+  "confirmPassword": "password",
+  "displayName": "Weak Password"
+}
+
+### Refresh. The old token is consumed and a new pair issued (rotation).
+# @name refreshed
+POST {{host}}/api/auth/refresh
+Content-Type: application/json
+
+{
+  "refreshToken": "{{refresh}}"
+}
+
+### Present the SAME (now spent) refresh token again → 403, and EVERY session
+### for that user is revoked. Reuse means a bug or a thief, and we cannot tell
+### which — so we assume the worst. See AuthService.RefreshAsync.
+POST {{host}}/api/auth/refresh
+Content-Type: application/json
+
+{
+  "refreshToken": "{{refresh}}"
+}
+
+### -------------------------------------------------------------------------
+### 17 · Admin: user management
+### -------------------------------------------------------------------------
+GET {{host}}/api/users
+Authorization: Bearer {{token}}
+
+### Creates the login AND its Agent row, because an employee with no agent
+### record cannot be assigned work.
+POST {{host}}/api/users
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "email": "newagent@tickethub.local",
+  "password": "Passw0rd!",
+  "displayName": "Yousef Darwish",
+  "userType": "Employee",
+  "roles": [ "Agent" ],
+  "departmentId": 1
+}
+
+### -------------------------------------------------------------------------
+### 18 · Soft delete
+### -------------------------------------------------------------------------
+### The row is still in the table. The global query filter simply stops
+### returning it — so the next GET is a 404 and the audit trail is intact.
+DELETE {{host}}/api/tickets/{{newTicketId}}
+Authorization: Bearer {{token}}
+
+###
+GET {{host}}/api/tickets/{{newTicketId}}
+Authorization: Bearer {{token}}

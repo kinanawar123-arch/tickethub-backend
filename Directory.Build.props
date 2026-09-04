@@ -1,0 +1,27 @@
+<Project>
+
+  <!--
+    Directory.Build.props is picked up automatically by MSBuild for EVERY project
+    underneath this folder. Putting shared settings here means we set them once
+    instead of copy-pasting them into four .csproj files (and forgetting one).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+
+    <!-- "using System;" etc. are added for us; less noise at the top of every file. -->
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Nullable reference types ON. The compiler now warns when a string? might be null.
+         This is why you will see "= null!" on required navigation properties. -->
+    <Nullable>enable</Nullable>
+
+    <!-- Generate the XML file that Swagger reads so our /// <summary> comments
+         show up as endpoint descriptions in the Swagger UI. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <!-- CS1591 = "missing XML comment for publicly visible type". We want the XML file,
+         but we do not want a warning for every DTO property. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+</Project>
